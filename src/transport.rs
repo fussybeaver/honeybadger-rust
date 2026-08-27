@@ -3,7 +3,7 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use std::io::Write;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const NOTICES_PATH: &str = "/v1/notices";
 pub(crate) const EVENTS_PATH: &str = "/v1/events";
@@ -250,6 +250,12 @@ impl Transport for ServerTransport {
         } else {
             &self.agent
         };
+        let started = Instant::now();
+        let total = agent
+            .config()
+            .timeouts()
+            .global
+            .ok_or_else(|| TransportError("transport request has no deadline".into()))?;
         let mut response = agent
             .post(url.as_str())
             .header("X-API-Key", &self.api_key)
@@ -288,11 +294,17 @@ impl Transport for ServerTransport {
             }
 
             url = next_url;
+            let remaining = total
+                .checked_sub(started.elapsed())
+                .ok_or_else(|| TransportError("transport request deadline exceeded".into()))?;
             response = agent
                 .get(url.as_str())
                 .header("X-API-Key", &self.api_key)
                 .header("Accept", "application/json")
                 .header("User-Agent", &self.user_agent)
+                .config()
+                .timeout_global(Some(remaining))
+                .build()
                 .call()
                 .map_err(|e| TransportError(e.to_string()))?;
         }
@@ -409,7 +421,7 @@ impl Transport for TestTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     fn inflate(body: &[u8]) -> String {
         let mut out = String::new();
@@ -711,19 +723,29 @@ mod tests {
     #[test]
     fn test_a_tightened_request_timeout_shortens_the_urgent_path() {
         // The urgent budget was a hardcoded 2s, so a caller who tightened
-        // request_timeout to 300ms still got a 2s hang on panic.
+        // request_timeout to 300ms still got a 2s hang on panic. Each response
+        // below is delayed for less than that budget, but the redirect chain is
+        // longer than the single budget it should share.
         //
-        // A socket that accepts and then says nothing: the connect succeeds, so
-        // what this measures is the global budget rather than the connect timeout.
+        // The socket accepts successfully, so what this measures is the global
+        // budget rather than the connect timeout.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
                 let _ = std::io::Read::read(&mut sock, &mut [0u8; 1024]);
-                // Must outlast the old hardcoded 2s budget: if the socket closed
-                // sooner, the client would fail on connection-closed rather than
-                // on its timeout, and the test would pass either way.
-                std::thread::sleep(Duration::from_secs(3));
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = sock.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                drop(sock);
+            }
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = std::io::Read::read(&mut sock, &mut [0u8; 1024]);
+                std::thread::sleep(Duration::from_millis(250));
+                let _ = sock.write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
             }
         });
 
@@ -744,6 +766,7 @@ mod tests {
             "the urgent path must honor the 300ms request timeout, not the old fixed 2s (took {:?})",
             started.elapsed()
         );
+        server.join().unwrap();
     }
 
     #[test]
