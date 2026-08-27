@@ -18,7 +18,6 @@ const URGENT_MAX_TOTAL: Duration = Duration::from_secs(5);
 const MAX_REDIRECTS: usize = 10;
 const HONEYBADGER_DOMAIN: &str = "honeybadger.io";
 const HONEYBADGER_SUBDOMAIN_SUFFIX: &str = ".honeybadger.io";
-const SUPPORTED_SCHEMES: [&str; 2] = ["http", "https"];
 
 /// Which Honeybadger API a request targets.
 #[non_exhaustive]
@@ -203,14 +202,15 @@ fn redirect_allowed(current: &url::Url, next: &url::Url) -> bool {
         return false;
     };
 
-    let same_host = current_host.eq_ignore_ascii_case(next_host);
-    let honeybadger_host = is_honeybadger_host(next_host);
-    let supported_scheme = SUPPORTED_SCHEMES.contains(&next.scheme());
-    let no_https_downgrade =
-        !(current.scheme() == SUPPORTED_SCHEMES[1] && next.scheme() == SUPPORTED_SCHEMES[0]);
+    let same_origin = current.scheme() == next.scheme()
+        && current_host.eq_ignore_ascii_case(next_host)
+        && current.port_or_known_default() == next.port_or_known_default();
+    let honeybadger_host = next.scheme() == "https"
+        && next.port_or_known_default() == Some(443)
+        && is_honeybadger_host(next_host);
     let no_credentials = next.username().is_empty() && next.password().is_none();
 
-    (same_host || honeybadger_host) && supported_scheme && no_https_downgrade && no_credentials
+    (same_origin || honeybadger_host) && no_credentials
 }
 
 fn build_agent(connect: Duration, total: Duration) -> ureq::Agent {
@@ -604,6 +604,10 @@ mod tests {
 
         assert!(redirect_allowed(
             &url("http://configured.example:8080"),
+            &url("http://configured.example:8080/path")
+        ));
+        assert!(!redirect_allowed(
+            &url("http://configured.example:8080"),
             &url("http://configured.example:9000/path")
         ));
         assert!(redirect_allowed(
@@ -613,6 +617,10 @@ mod tests {
         assert!(redirect_allowed(
             &url("http://honeybadger.io/v1/notices"),
             &url("https://honeybadger.io/v1/notices")
+        ));
+        assert!(!redirect_allowed(
+            &url("https://api.honeybadger.io/v1/notices"),
+            &url("https://eu.honeybadger.io:8443/v1/notices")
         ));
         assert!(!redirect_allowed(
             &url("https://api.honeybadger.io/v1/notices"),
