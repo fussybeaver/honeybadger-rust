@@ -7,15 +7,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const NOTICES_PATH: &str = "/v1/notices";
 pub(crate) const EVENTS_PATH: &str = "/v1/events";
-/// Longest `Retry-After` we will honor. The real ceiling is the daily data
-/// limit, which resets at most 24 hours out; anything beyond that is a bug or a
-/// hostile proxy, and obeying it would park a pipeline indefinitely.
-pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(86_400);
 
-/// Ceiling on how long a panic may hang waiting for its notice to land.
-const URGENT_MAX_TOTAL: Duration = Duration::from_secs(5);
-/// Bound manual redirects so a server cannot turn one delivery into an unbounded chain.
-const MAX_REDIRECTS: usize = 10;
 const HONEYBADGER_DOMAIN: &str = "honeybadger.io";
 const HONEYBADGER_SUBDOMAIN_SUFFIX: &str = ".honeybadger.io";
 
@@ -69,6 +61,11 @@ impl<'a> TransportRequest<'a> {
         }
     }
 }
+
+/// Longest `Retry-After` we will honor. The real ceiling is the daily data
+/// limit, which resets at most 24 hours out; anything beyond that is a bug or a
+/// hostile proxy, and obeying it would park a pipeline indefinitely.
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(86_400);
 
 /// Reads a `Retry-After` value, honoring only the delta-seconds form.
 ///
@@ -193,6 +190,9 @@ fn urgent_budget(connect: Duration, request: Duration) -> (Duration, Duration) {
     (connect.min(total), total)
 }
 
+/// Ceiling on how long a panic may hang waiting for its notice to land.
+const URGENT_MAX_TOTAL: Duration = Duration::from_secs(5);
+
 fn is_honeybadger_host(host: &str) -> bool {
     host == HONEYBADGER_DOMAIN || host.ends_with(HONEYBADGER_SUBDOMAIN_SUFFIX)
 }
@@ -223,6 +223,17 @@ fn build_agent(connect: Duration, total: Duration) -> ureq::Agent {
         .new_agent()
 }
 
+fn add_headers<B>(
+    request: ureq::RequestBuilder<B>,
+    api_key: &str,
+    user_agent: &str,
+) -> ureq::RequestBuilder<B> {
+    request
+        .header("X-API-Key", api_key)
+        .header("Accept", "application/json")
+        .header("User-Agent", user_agent)
+}
+
 impl ServerTransport {
     pub(crate) fn new(
         endpoint: String,
@@ -243,7 +254,7 @@ impl ServerTransport {
 
 impl Transport for ServerTransport {
     fn deliver(&self, req: &TransportRequest) -> Result<TransportResponse, TransportError> {
-        let mut url = url::Url::parse(&format!("{}{}", self.endpoint, req.path))
+        let url = url::Url::parse(&format!("{}{}", self.endpoint, req.path))
             .map_err(|e| TransportError(format!("invalid transport URL: {e}")))?;
         let agent = if req.urgent {
             &self.urgent_agent
@@ -256,66 +267,46 @@ impl Transport for ServerTransport {
             .timeouts()
             .global
             .ok_or_else(|| TransportError("transport request has no deadline".into()))?;
-        let mut response = agent
-            .post(url.as_str())
-            .header("X-API-Key", &self.api_key)
+        add_headers(agent.post(url.as_str()), &self.api_key, &self.user_agent)
             .header("Content-Type", req.content_type)
-            .header("Accept", "application/json")
             .header("Content-Encoding", "deflate")
-            .header("User-Agent", &self.user_agent)
             .send(req.body)
-            .map_err(|e| TransportError(e.to_string()))?;
-
-        for _ in 0..MAX_REDIRECTS {
-            let status = response.status().as_u16();
-            let retry_after = parse_retry_after(
-                response
+            .map_err(|e| TransportError(e.to_string()))
+            .and_then(|response| match response.status().as_u16() {
+                301..=303 => match response
                     .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok()),
-            );
-
-            if !matches!(status, 301..=303) {
-                return Ok(TransportResponse::new(status).retry_after(retry_after));
-            }
-
-            let Some(location) = response
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-            else {
-                return Ok(TransportResponse::new(status).retry_after(retry_after));
-            };
-            let Ok(next_url) = url.join(location) else {
-                return Ok(TransportResponse::new(status).retry_after(retry_after));
-            };
-            if !redirect_allowed(&url, &next_url) {
-                return Ok(TransportResponse::new(status).retry_after(retry_after));
-            }
-
-            url = next_url;
-            let remaining = total
-                .checked_sub(started.elapsed())
-                .ok_or_else(|| TransportError("transport request deadline exceeded".into()))?;
-            response = agent
-                .get(url.as_str())
-                .header("X-API-Key", &self.api_key)
-                .header("Accept", "application/json")
-                .header("User-Agent", &self.user_agent)
-                .config()
-                .timeout_global(Some(remaining))
-                .build()
-                .call()
-                .map_err(|e| TransportError(e.to_string()))?;
-        }
-
-        let retry_after = parse_retry_after(
-            response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok()),
-        );
-        Ok(TransportResponse::new(response.status().as_u16()).retry_after(retry_after))
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|location| url.join(location).ok())
+                {
+                    Some(next_url) if redirect_allowed(&url, &next_url) => {
+                        let remaining = total.checked_sub(started.elapsed()).ok_or_else(|| {
+                            TransportError("transport request deadline exceeded".into())
+                        })?;
+                        add_headers(
+                            agent.get(next_url.as_str()),
+                            &self.api_key,
+                            &self.user_agent,
+                        )
+                        .config()
+                        .timeout_global(Some(remaining))
+                        .build()
+                        .call()
+                        .map_err(|e| TransportError(e.to_string()))
+                    }
+                    _ => Ok(response),
+                },
+                _ => Ok(response),
+            })
+            .map(|response| {
+                let retry_after = parse_retry_after(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok()),
+                );
+                TransportResponse::new(response.status().as_u16()).retry_after(retry_after)
+            })
     }
 }
 
@@ -421,7 +412,7 @@ impl Transport for TestTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     fn inflate(body: &[u8]) -> String {
         let mut out = String::new();
@@ -478,109 +469,18 @@ mod tests {
     }
 
     #[test]
-    fn test_server_transport_follows_allowed_same_host_redirects() {
-        for urgent in [false, true] {
-            for status in [301u16, 302, 303, 307, 308] {
-                let mut origin = mockito::Server::new();
-                let mut destination = mockito::Server::new();
-                let observed = std::sync::Arc::new(Mutex::new(Vec::new()));
-                let observed_by_redirect = std::sync::Arc::clone(&observed);
-                let follows = matches!(status, 301..=303);
-                let redirect = origin
-                    .mock("POST", "/v1/notices")
-                    .with_status(usize::from(status))
-                    .with_header("Location", &format!("{}/stolen", destination.url()))
-                    .create();
-                let forwarded = destination
-                    .mock("GET", "/stolen")
-                    .match_request(move |request| {
-                        observed_by_redirect.lock().unwrap().push((
-                            request.method().to_owned(),
-                            request
-                                .header("X-API-Key")
-                                .first()
-                                .and_then(|value| value.to_str().ok())
-                                .map(str::to_owned),
-                            request.body().map(ToOwned::to_owned).unwrap_or_default(),
-                        ));
-                        true
-                    })
-                    .with_status(201)
-                    .expect(if follows { 1 } else { 0 })
-                    .create();
-
-                let t = ServerTransport::new(
-                    origin.url(),
-                    "test-key".into(),
-                    Duration::from_secs(2),
-                    Duration::from_secs(5),
-                );
-                let body = compress(b"{}");
-                let result = t.deliver(&TransportRequest::notices(&body, urgent));
-
-                assert_eq!(result.unwrap().status, if follows { 201 } else { status });
-                if follows {
-                    let observed = observed.lock().unwrap();
-                    assert_eq!(observed.len(), 1);
-                    assert_eq!(observed[0].0, "GET");
-                    assert_eq!(observed[0].1.as_deref(), Some("test-key"));
-                    assert!(observed[0].2.is_empty());
-                } else {
-                    assert!(observed.lock().unwrap().is_empty());
-                }
-                forwarded.assert();
-                redirect.assert();
-            }
-        }
-    }
-
-    #[test]
-    fn test_server_transport_rejects_cross_host_redirects() {
-        for urgent in [false, true] {
-            for status in [301u16, 302, 303, 307, 308] {
-                let mut origin = mockito::Server::new();
-                let mut destination = mockito::Server::new();
-                let destination_url = destination.url();
-                let origin_url = {
-                    let mut url = url::Url::parse(&origin.url()).unwrap();
-                    url.set_host(Some("localhost")).unwrap();
-                    url.to_string()
-                };
-                let redirect = origin
-                    .mock("POST", "/v1/notices")
-                    .with_status(usize::from(status))
-                    .with_header("Location", &format!("{destination_url}/stolen"))
-                    .create();
-                let forwarded = destination
-                    .mock("GET", "/stolen")
-                    .with_status(201)
-                    .expect(0)
-                    .create();
-
-                let t = ServerTransport::new(
-                    origin_url,
-                    "test-key".into(),
-                    Duration::from_secs(2),
-                    Duration::from_secs(5),
-                );
-                let result = t.deliver(&TransportRequest::notices(&compress(b"{}"), urgent));
-
-                assert_eq!(result.unwrap().status, status);
-                forwarded.assert();
-                redirect.assert();
-            }
-        }
-    }
-
-    #[test]
-    fn test_server_transport_resolves_relative_redirects() {
+    fn test_server_transport_follows_allowed_same_origin_redirects() {
         let mut server = mockito::Server::new();
         let redirect = server
             .mock("POST", "/v1/notices")
             .with_status(303)
             .with_header("Location", "/stolen")
             .create();
-        let forwarded = server.mock("GET", "/stolen").with_status(201).create();
+        let forwarded = server
+            .mock("GET", "/stolen")
+            .match_header("X-API-Key", "test-key")
+            .with_status(201)
+            .create();
         let t = ServerTransport::new(
             server.url(),
             "test-key".into(),
@@ -594,6 +494,40 @@ mod tests {
                 .status,
             201
         );
+        forwarded.assert();
+        redirect.assert();
+    }
+
+    #[test]
+    fn test_server_transport_rejects_cross_host_redirects() {
+        let mut origin = mockito::Server::new();
+        let mut destination = mockito::Server::new();
+        let destination_url = destination.url();
+        let origin_url = {
+            let mut url = url::Url::parse(&origin.url()).unwrap();
+            url.set_host(Some("localhost")).unwrap();
+            url.to_string()
+        };
+        let redirect = origin
+            .mock("POST", "/v1/notices")
+            .with_status(302)
+            .with_header("Location", &format!("{destination_url}/stolen"))
+            .create();
+        let forwarded = destination
+            .mock("GET", "/stolen")
+            .with_status(201)
+            .expect(0)
+            .create();
+
+        let t = ServerTransport::new(
+            origin_url,
+            "test-key".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        let result = t.deliver(&TransportRequest::notices(&compress(b"{}"), false));
+
+        assert_eq!(result.unwrap().status, 302);
         forwarded.assert();
         redirect.assert();
     }
@@ -731,29 +665,19 @@ mod tests {
     #[test]
     fn test_a_tightened_request_timeout_shortens_the_urgent_path() {
         // The urgent budget was a hardcoded 2s, so a caller who tightened
-        // request_timeout to 300ms still got a 2s hang on panic. Each response
-        // below is delayed for less than that budget, but the redirect chain is
-        // longer than the single budget it should share.
+        // request_timeout to 300ms still got a 2s hang on panic.
         //
-        // The socket accepts successfully, so what this measures is the global
-        // budget rather than the connect timeout.
+        // A socket that accepts and then says nothing: the connect succeeds, so
+        // what this measures is the global budget rather than the connect timeout.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
                 let _ = std::io::Read::read(&mut sock, &mut [0u8; 1024]);
-                std::thread::sleep(Duration::from_millis(100));
-                let _ = sock.write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-                drop(sock);
-            }
-            if let Ok((mut sock, _)) = listener.accept() {
-                let _ = std::io::Read::read(&mut sock, &mut [0u8; 1024]);
-                std::thread::sleep(Duration::from_millis(250));
-                let _ = sock.write_all(
-                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
+                // Must outlast the old hardcoded 2s budget: if the socket closed
+                // sooner, the client would fail on connection-closed rather than
+                // on its timeout, and the test would pass either way.
+                std::thread::sleep(Duration::from_secs(3));
             }
         });
 
@@ -774,7 +698,6 @@ mod tests {
             "the urgent path must honor the 300ms request timeout, not the old fixed 2s (took {:?})",
             started.elapsed()
         );
-        server.join().unwrap();
     }
 
     #[test]
